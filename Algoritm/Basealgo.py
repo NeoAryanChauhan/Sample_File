@@ -1,195 +1,222 @@
 import random
-from pymongo import MongoClient
-from db_export import export_step_to_db  # Removed unused import to prevent ImportError
+import time  # Import time for delay
+from db_export import export_to_website_models
 
-# Import MongoDB export function from db_export.py
-# --- CONFIGURATION & CONSTANTS ---
 # -----------------------------
-SIZE = 8
+# Grid and simulation settings
+# -----------------------------
+SIZE = 4
 CYCLE_TIME = 120
-MIN_GREEN = 5
-YELLOW_TIME = 5
-SATURATION_FLOW_RATE = 0.5
+MIN_GREEN = 15
+YELLOW_TIME = 3
+CAPACITY_THRESHOLD = 10  # outgoing lane threshold
 
-TURN_PROBS = {'straight': 0.7, 'left': 0.15, 'right': 0.15}
-DIRS = ['N', 'E', 'S', 'W']
-OPPOSITE = {'N':'S', 'E':'W', 'S':'N', 'W':'E'}
+DIRS = ['N', 'S', 'E', 'W']
+OPPOSITE = {'N': 'S', 'S': 'N', 'E': 'W', 'W': 'E'}
 
-# Using Indian (left-hand drive) logic
+# Turn mapping
 TURN_MAP = {
-    'N': {'left': 'E', 'straight': 'S', 'right': 'W'},
-    'E': {'left': 'S', 'straight': 'W', 'right': 'N'},
-    'S': {'left': 'W', 'straight': 'N', 'right': 'E'},
-    'W': {'left': 'N', 'straight': 'E', 'right': 'S'}
+    'N': {'straight': 'S', 'left': 'E', 'right': 'W'},
+    'S': {'straight': 'N', 'left': 'W', 'right': 'E'},
+    'E': {'straight': 'W', 'left': 'N', 'right': 'S'},
+    'W': {'straight': 'E', 'left': 'S', 'right': 'N'}
 }
 
-# Global State Variables
-nodes, node_pos, pos_node, grid = [], {}, {}, {}
-
 # -----------------------------
-# --- HELPER FUNCTION ---
+# Nodes initialization
 # -----------------------------
-
-def get_turn_type(from_dir, to_dir):
-    """Safely determines the turn type (left, right, straight)."""
-    for turn_name, dest_dir in TURN_MAP[from_dir].items():
-        if dest_dir == to_dir:
-            return turn_name
-    return None
-
-# -----------------------------
-# --- SETUP AND INITIALIZATION ---
-# -----------------------------
+nodes = [chr(ord('A') + i) for i in range(SIZE*SIZE)]
+node_pos = {nodes[r*SIZE + c]: (r,c) for r in range(SIZE) for c in range(SIZE)}
+pos_node = {v:k for k,v in node_pos.items()}
 
 def initialize_grid():
-    """Sets up the grid and populates each turning direction with random traffic."""
-    global nodes, node_pos, pos_node, grid
-    
-    nodes = [chr(ord('A') + i) for i in range(SIZE*SIZE)]
-    
-    node_pos = {nodes[r*SIZE + c]: (r,c) for r in range(SIZE) for c in range(SIZE)}
-    pos_node = {v:k for k,v in node_pos.items()}
+    """Create a new random traffic grid."""
     grid = {}
-
     for n in nodes:
-        r,c = node_pos[n]
-        neighbors = {
-            'N': pos_node.get((r-1, c)), 'E': pos_node.get((r, c+1)),
-            'S': pos_node.get((r+1, c)), 'W': pos_node.get((r, c-1))
+        r, c = node_pos[n]
+        neighbors = {}
+        if r > 0: neighbors['N'] = pos_node[(r-1, c)]
+        if r < SIZE-1: neighbors['S'] = pos_node[(r+1, c)]
+        if c > 0: neighbors['W'] = pos_node[(r, c-1)]
+        if c < SIZE-1: neighbors['E'] = pos_node[(r, c+1)]
+
+        queues = {d: {d2: random.randint(0, 20) for d2 in DIRS if d2 != d} for d in DIRS}
+
+        grid[n] = {
+            'neighbors': neighbors,
+            'queues': queues,
+            'phase_times': {},
+            'timeline': [],
+            'lane_allowance': {},
+            'blocked_phases': [],
+            'green_lanes': [],
+            'total_vehicles': sum(sum(q.values()) for q in queues.values())
         }
-        neighbors = {d: node for d, node in neighbors.items() if node is not None}
-        
-        queues = {}
-        # For each possible incoming lane...
-        for from_dir in neighbors.keys():
-            queues[from_dir] = {}
-            # ... and for each possible turn from that lane...
-            possible_turns = TURN_MAP[OPPOSITE[from_dir]]
-            for turn_type in ['straight', 'left', 'right']:
-                to_dir = possible_turns.get(turn_type)
-                # ... generate a random number of cars.
-                if to_dir in neighbors:
-                    num_cars = random.randint(0, 20)
-                    if num_cars > 0:
-                        queues[from_dir][to_dir] = num_cars
-        
-        grid[n] = {'queues': queues, 'green': {}, 'signals': {}, 'neighbors': neighbors}
-
+    return grid
 
 # -----------------------------
-# --- CORE ALGORITHMS ---
+# Helper functions
 # -----------------------------
+def is_outgoing_blocked(grid, node, from_dir, to_dir):
+    dest = grid[node]['neighbors'].get(to_dir)
+    if not dest: 
+        return False
+    arrival_dir = OPPOSITE[to_dir]
+    dest_queues = grid[dest]['queues'].get(arrival_dir, {})
+    total_waiting = sum(dest_queues.values())
+    return total_waiting >= CAPACITY_THRESHOLD
 
-def allocate_green_indian_model(node):
-    """Implements the smart, 4-stage proportional model for Indian traffic."""
+def allocate_dynamic_cycle(grid, node):
     data = grid[node]
-    data['green'], data['signals'] = {}, {}
-    
-    phases = {
-        'ns_right': {'dirs': ['N', 'S'], 'turns': ['right']}, 'ns_main': {'dirs': ['N', 'S'], 'turns': ['straight', 'left']},
-        'ew_right': {'dirs': ['E', 'W'], 'turns': ['right']}, 'ew_main': {'dirs': ['E', 'W'], 'turns': ['straight', 'left']}
-    }
-    phase_demands = {name: 0 for name in phases}
-    
-    for from_dir, turns in data['queues'].items():
-        for to_dir, cars in turns.items():
-            turn_type = get_turn_type(OPPOSITE[from_dir], to_dir)
-            if turn_type:
-                phase_key = ('ns_' if from_dir in ['N','S'] else 'ew_') + ('right' if turn_type == 'right' else 'main')
-                phase_demands[phase_key] += cars
+    queues = data['queues']
 
-    total_demand = sum(phase_demands.values())
-    if total_demand == 0: return
+    phases = [
+        ('ns_main', ['N','S'], ['straight','left']),
+        ('ew_main', ['E','W'], ['straight','left']),
+        ('ns_right', ['N','S'], ['right']),
+        ('ew_right', ['E','W'], ['right'])
+    ]
 
-    active_phases = sum(1 for demand in phase_demands.values() if demand > 0)
-    total_usable_green = CYCLE_TIME - (active_phases * YELLOW_TIME)
+    # Compute demand per phase
+    phase_demand = {p[0]: 0 for p in phases}
+    for p_name, dirs, turn_types in phases:
+        for from_dir in dirs:
+            for t in turn_types:
+                to_dir = TURN_MAP[from_dir].get(t)
+                if not to_dir: continue
+                num = queues.get(from_dir, {}).get(to_dir, 0)
+                phase_demand[p_name] += num
 
-    phase_times = {name: int(max(MIN_GREEN, (demand / total_demand) * total_usable_green)) if demand > 0 else 0 for name, demand in phase_demands.items()}
+    active_phases = [k for k,v in phase_demand.items() if v>0]
+    if not active_phases:
+        data['phase_times'] = {k:0 for k in phase_demand}
+        return
 
-    for phase_name, g_time in phase_times.items():
-        if g_time > 0:
-            for from_dir in phases[phase_name]['dirs']:
-                for turn_type in phases[phase_name]['turns']:
-                    to_dir = TURN_MAP[OPPOSITE[from_dir]].get(turn_type)
-                    if from_dir in data['queues'] and to_dir in data['queues'][from_dir]:
-                        if from_dir not in data['green']: data['green'][from_dir] = {}
-                        if from_dir not in data['signals']: data['signals'][from_dir] = {}
-                        data['green'][from_dir][to_dir] = g_time
-                        data['signals'][from_dir][to_dir] = 'GREEN'
+    total_demand = sum(phase_demand[p] for p in active_phases)
+    total_usable_green = max(0, CYCLE_TIME - len(active_phases)*YELLOW_TIME)
 
-def simulate_step():
-    """Orchestrates a full simulation step with instant movement."""
-    moves = []
+    # Initial proportional allocation
+    phase_times = {}
+    for p in phase_demand:
+        if phase_demand[p] > 0:
+            raw = (phase_demand[p]/total_demand)*total_usable_green
+            phase_times[p] = max(MIN_GREEN, int(round(raw)))
+        else:
+            phase_times[p] = 0
 
-    for n in nodes:
-        allocate_green_indian_model(n)
-        
-    for n in nodes:
-        data = grid[n]
-        for from_dir, turns in data.get('green', {}).items():
-            for to_dir, green_time in turns.items():
-                if from_dir in data['queues'] and to_dir in data['queues'].get(from_dir, {}):
-                    queue_cars = data['queues'][from_dir][to_dir]
-                    moved = min(queue_cars, int(green_time * SATURATION_FLOW_RATE))
-                    if moved > 0:
-                        data['queues'][from_dir][to_dir] -= moved
-                        destination_node = data['neighbors'][to_dir]
-                        arrival_dir = OPPOSITE[to_dir]
-                        moves.append((destination_node, arrival_dir, moved))
-    
-    for destination_node, arrival_dir, num_cars in moves:
-        if arrival_dir not in grid[destination_node]['queues']:
-            grid[destination_node]['queues'][arrival_dir] = {}
-        p_turns = TURN_MAP[OPPOSITE[arrival_dir]]
-        for turn_t, turn_prob in TURN_PROBS.items():
-            turn_d = p_turns.get(turn_t)
-            if turn_d in grid[destination_node]['neighbors']:
-                num_c = int(num_cars * turn_prob)
-                if num_c > 0:
-                    grid[destination_node]['queues'][arrival_dir][turn_d] = grid[destination_node]['queues'][arrival_dir].get(turn_d, 0) + num_c
+    # Adjust remainder
+    allocated = sum(phase_times[p] for p in phase_times)
+    remainder = total_usable_green - allocated
+    if remainder != 0:
+        ordered = sorted(active_phases, key=lambda x: phase_demand[x], reverse=True)
+        i = 0
+        while remainder != 0 and ordered:
+            phase_times[ordered[i%len(ordered)]] += (1 if remainder>0 else -1)
+            remainder = total_usable_green - sum(phase_times[p] for p in phase_times)
+            i += 1
 
-def print_report(step):
-    """Prints a report showing all existing lanes for every node."""
-    print(f"\n\n{'='*20} Step {step} Report {'='*20}")
-    
-    for n in sorted(nodes):
-        data = grid[n]
-        print(f"\n--- Node {n} ---")
-        
-        has_traffic = False
-        for from_dir in sorted(data['neighbors'].keys()):
-            actual_from_dir = OPPOSITE[from_dir]
-            queues = data['queues'].get(actual_from_dir, {})
-            total_cars = sum(queues.values())
-            
-            green_time = next((t for t in data['green'].get(actual_from_dir, {}).values() if t > 0), 0)
-            
-            print(f"  Lane {actual_from_dir}: Cars Waiting = {total_cars}, Green Time = {green_time}s")
-            if total_cars > 0:
-                has_traffic = True
-            
-            possible_turns = TURN_MAP[actual_from_dir]
-            for turn_type in ['straight', 'left', 'right']:
-                to_dir = possible_turns.get(turn_type)
-                if to_dir in data['neighbors']:
-                    cars = queues.get(to_dir, 0)
-                    signal = data['signals'].get(actual_from_dir, {}).get(to_dir, 'RED')
-                    green_time_turn = data['green'].get(actual_from_dir, {}).get(to_dir, 0)
-                    print(f"    -> To {to_dir}: {cars:<3} cars | Signal: {signal} ({green_time_turn}s)")
-        
-        if not has_traffic:
-            print("  No traffic at this intersection.")
+    # Lane allowance & green lanes
+    lane_allowance = {}
+    green_lanes = []
+    blocked_phases = set()
+    for p_name, dirs, turn_types in phases:
+        lane_allowed = False
+        for from_dir in dirs:
+            for t in turn_types:
+                to_dir = TURN_MAP[from_dir].get(t)
+                if not to_dir: continue
+                cars = queues.get(from_dir, {}).get(to_dir, 0)
+                blocked = is_outgoing_blocked(grid, node, from_dir, to_dir) and cars>0
+                allowed = (cars>0) and not blocked
+                lane_allowance.setdefault(from_dir, {})[to_dir] = allowed
+                if allowed:
+                    lane_allowed = True
+                    green_lanes.append((from_dir, to_dir))
+                    dest = data['neighbors'].get(to_dir)
+                    if dest:
+                        grid[dest].setdefault('green_lanes', []).append((OPPOSITE[to_dir], OPPOSITE[from_dir]))
+        if not lane_allowed:
+            blocked_phases.add(p_name)
+
+    # Redistribute blocked phase times
+    usable_phases = [p for p in phase_times if p not in blocked_phases and phase_times[p]>0]
+    locked_out_time = sum(phase_times[p] for p in blocked_phases)
+    if locked_out_time > 0 and usable_phases:
+        usable_demand = sum(phase_demand[p] for p in usable_phases)
+        for p in usable_phases:
+            add = int(round((phase_demand[p]/usable_demand)*locked_out_time)) if usable_demand>0 else 0
+            phase_times[p] += add
+    for p in blocked_phases: phase_times[p]=0
+
+    # Build timeline
+    timeline = []
+    cur = 0
+    for p_name, dirs, turn_types in phases:
+        g = phase_times.get(p_name, 0)
+        if g > 0:
+            timeline.append((p_name, cur, cur+g))
+            cur += g
+            cur += YELLOW_TIME
+
+    data['phase_times'] = phase_times
+    data['timeline'] = timeline
+    data['lane_allowance'] = lane_allowance
+    data['blocked_phases'] = list(blocked_phases)
+    data['green_lanes'] = green_lanes
+    data['total_vehicles'] = sum(sum(q.values()) for q in queues.values())
 
 # -----------------------------
-# --- MAIN EXECUTION ---
+# Print phase chart for a node
 # -----------------------------
-if __name__ == '__main__':
-    initialize_grid()
-    print("--- Simulation Start: Grid initialized with random traffic ---")
-    print_report(step=0)
-    export_step_to_db(step=0, grid=grid, nodes=nodes)
+def print_cycle_chart(grid, node):
+    data = grid[node]
+    print(f"\nNode {node} cycle (CYCLE={CYCLE_TIME}s, MIN={MIN_GREEN}s, YELLOW={YELLOW_TIME}s):")
+    print(f"Total vehicles at node: {data['total_vehicles']}")
 
-    print("\n--- Running Simulation for 1 Step ---")
-    simulate_step()
-    print_report(step=1)
-    export_step_to_db(step=1, grid=grid, nodes=nodes)
+    phases = [
+        ('ns_main', ['N','S'], ['straight','left']),
+        ('ew_main', ['E','W'], ['straight','left']),
+        ('ns_right', ['N','S'], ['right']),
+        ('ew_right', ['E','W'], ['right'])
+    ]
+
+    for p_name, dirs, turn_types in phases:
+        g_start_end = next(((name, s, e) for name, s, e in data['timeline'] if name == p_name), None)
+        if not g_start_end:
+            continue
+        _, start, end = g_start_end
+        print(f"Phase {p_name} [{start}s -> {end}s]")
+
+        for from_dir in dirs:
+            for turn_type in turn_types:
+                to_dir = TURN_MAP[from_dir].get(turn_type)
+                if not to_dir or from_dir not in data['queues']: 
+                    continue
+                cars = data['queues'][from_dir].get(to_dir,0)
+                allowed = data['lane_allowance'].get(from_dir, {}).get(to_dir, False)
+                sig = 'GREEN' if allowed else 'RED'
+                print(f"  {from_dir:<3} {turn_type:<8} -> {to_dir:<3}: {sig} ({cars} cars)")
+
+# -----------------------------
+# Simulation step
+# -----------------------------
+def simulate_step(grid):
+    for n in nodes:
+        allocate_dynamic_cycle(grid, n)
+
+# -----------------------------
+# Main loop for 10 steps every 10 sec
+# -----------------------------
+def main():
+    for step in range(1, 11):  # Maximum 10 iterations
+        print(f"\n=== Step {step} ===")
+        grid = initialize_grid()  # Generate new traffic randomly each step
+        simulate_step(grid)
+        for n in nodes:
+            print_cycle_chart(grid, n)
+        # Export to MongoDB after each step
+        export_to_website_models(grid, nodes, node_pos, section_name=f"Grid Step {step}", location="Sector 5, City")
+        time.sleep(10)  # Wait 10 seconds before next iteration
+
+if __name__ == "__main__":
+    main()
