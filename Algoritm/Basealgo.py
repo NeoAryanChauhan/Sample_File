@@ -1,6 +1,6 @@
 import random
 from pymongo import MongoClient
-# from db_export import export_step_to_db  # Removed unused import to prevent ImportError
+from db_export import export_step_to_db  # Removed unused import to prevent ImportError
 
 # Import MongoDB export function from db_export.py
 # --- CONFIGURATION & CONSTANTS ---
@@ -186,10 +186,10 @@ def print_report(step):
 if __name__ == '__main__':
     initialize_grid()
     print("--- Simulation Start: Grid initialized with random traffic ---")
-
-    print_report(step=0) # Show initial random state
+    print_report(step=0)
+    export_step_to_db(step=0, grid=grid, nodes=nodes)
 
     print("\n--- Running Simulation for 1 Step ---")
     simulate_step()
-    
-    print_report(step=1) # Show state after one step
+    print_report(step=1)
+    export_step_to_db(step=1, grid=grid, nodes=nodes)
